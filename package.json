@@ -1,0 +1,41 @@
+{
+  "name": "@lms/database",
+  "version": "0.0.0",
+  "private": true,
+  "license": "MIT",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "scripts": {
+    "build": "echo 'No build needed — consumed as TypeScript source'",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src/ --ext .ts",
+    "clean": "rm -rf node_modules/.prisma",
+    "db:generate": "prisma generate",
+    "db:migrate": "prisma migrate dev --schema=./prisma/schema.prisma",
+    "db:migrate:prod": "prisma migrate deploy --schema=./prisma/schema.prisma",
+    "db:push": "prisma db push --schema=./prisma/schema.prisma",
+    "db:seed": "tsx src/seed.ts",
+    "db:reset": "prisma migrate reset --schema=./prisma/schema.prisma --force && tsx src/seed.ts",
+    "db:studio": "prisma studio --schema=./prisma/schema.prisma",
+    "db:validate": "prisma validate --schema=./prisma/schema.prisma",
+    "db:format": "prisma format --schema=./prisma/schema.prisma"
+  },
+  "prisma": {
+    "seed": "tsx src/seed.ts",
+    "schema": "./prisma/schema.prisma"
+  },
+  "dependencies": {
+    "@prisma/client": "^5.20.0"
+  },
+  "devDependencies": {
+    "@lms/eslint-config": "workspace:*",
+    "@lms/typescript-config": "workspace:*",
+    "eslint": "^9.11.1",
+    "prisma": "^5.20.0",
+    "tsx": "^4.19.1",
+    "typescript": "^5.6.3"
+  }
+}

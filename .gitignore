@@ -1,0 +1,25 @@
+# Workspaces and Build Artifacts
+node_modules/
+.next/
+dist/
+build/
+.turbo/
+out/
+
+# IDE / System Specific Files
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.log
+
+# Environment Variables & Encryption Keys
+.env
+.env.local
+.env.production
+.env.development.local
+*.pem
+
+# Local DB SQLite testing artifacts if any
+*.db
+*.db-journal

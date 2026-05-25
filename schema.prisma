@@ -1,0 +1,759 @@
+// =============================================================================
+//  LMS Platform — Prisma Schema
+//  packages/database/prisma/schema.prisma
+//
+//  Design decisions:
+//  • Soft delete:  deletedAt DateTime? — filtered in middleware, not WHERE clauses
+//  • Audit fields: createdAt, updatedAt on every mutable model
+//  • Cascade rules: Cascade on tight ownership (user→profile, course→module→lesson)
+//                   Restrict/SetNull on loose references (instructor deleted ≠ course deleted)
+//  • Indexes:      composite indexes on every FK + common filter pattern
+//  • cuid()        used for IDs — URL-safe, collision-resistant, sortable prefix
+// =============================================================================
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["fullTextSearch", "fullTextIndex"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =============================================================================
+//  ENUMS
+// =============================================================================
+
+enum Role {
+  STUDENT
+  INSTRUCTOR
+  ADMIN
+}
+
+enum SubmissionStatus {
+  PENDING
+  RUNNING
+  ACCEPTED
+  WRONG_ANSWER
+  TIME_LIMIT_EXCEEDED
+  MEMORY_LIMIT_EXCEEDED
+  RUNTIME_ERROR
+  COMPILE_ERROR
+  INTERNAL_ERROR
+}
+
+enum Language {
+  JAVASCRIPT
+  PYTHON
+  JAVA
+  CPP
+}
+
+enum Difficulty {
+  EASY
+  MEDIUM
+  HARD
+}
+
+enum QuestionType {
+  MCQ
+  TRUE_FALSE
+  MULTI_SELECT
+}
+
+enum NotificationType {
+  SUBMISSION_RESULT
+  QUIZ_GRADED
+  ASSIGNMENT_GRADED
+  CERTIFICATE_ISSUED
+  COURSE_ANNOUNCEMENT
+  AI_HINT_READY
+  AI_REVIEW_READY
+  NEW_DISCUSSION_REPLY
+}
+
+enum AssignmentStatus {
+  DRAFT
+  SUBMITTED
+  GRADED
+  RETURNED
+}
+
+enum CourseStatus {
+  DRAFT
+  UNDER_REVIEW
+  PUBLISHED
+  ARCHIVED
+}
+
+enum DiscussionType {
+  GENERAL
+  QUESTION
+  ANNOUNCEMENT
+}
+
+// =============================================================================
+//  USER & IDENTITY
+// =============================================================================
+
+/// Core authentication record. Holds credentials and role only.
+/// All display/profile data lives in Profile to keep this table lean.
+model User {
+  id               String    @id @default(cuid())
+  email            String    @unique
+  passwordHash     String
+  role             Role      @default(STUDENT)
+  isVerified       Boolean   @default(false)
+  isActive         Boolean   @default(true)  // soft-disable without deleting
+
+  // Auth tokens
+  refreshTokenHash String?   // hashed; plaintext never stored
+  tokenVersion     Int       @default(0)  // increment to invalidate all sessions
+
+  // Soft delete
+  deletedAt        DateTime?
+
+  // Audit
+  createdAt        DateTime  @default(now())
+  updatedAt        DateTime  @updatedAt
+  lastLoginAt      DateTime?
+
+  // Relations — owned
+  profile          Profile?
+  socialLinks      UserSocialLink[]
+
+  // Relations — as instructor
+  coursesCreated   Course[]
+  challengesCreated CodingChallenge[] @relation("ChallengeAuthor")
+
+  // Relations — as student
+  enrollments      Enrollment[]
+  submissions      Submission[]
+  quizAttempts     QuizAttempt[]
+  assignmentSubs   AssignmentSubmission[]
+  lessonProgress   LessonProgress[]
+  certificates     Certificate[]
+  notifications    Notification[]
+  chatHistories    ChatHistory[]
+  discussionPosts  DiscussionPost[]
+  discussionVotes  DiscussionVote[]
+
+  // Audit trail — who mutated what
+  auditLogs        AuditLog[]
+
+  @@index([email])
+  @@index([role, isActive])
+  @@index([deletedAt])
+  @@map("users")
+}
+
+/// Extended user data. 1-to-1 with User; created automatically on registration.
+model Profile {
+  id          String    @id @default(cuid())
+  userId      String    @unique
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  firstName   String
+  lastName    String
+  avatarUrl   String?
+  bio         String?   @db.Text
+  skills      String[]  // free-form tags
+  headline    String?   // "Full-stack developer | React enthusiast"
+  location    String?
+  website     String?
+
+  // Gamification
+  xp          Int       @default(0)
+  streak      Int       @default(0)
+  longestStreak Int     @default(0)
+  lastStreakDate DateTime?
+
+  // Metadata
+  timezone    String    @default("UTC")
+  language    String    @default("en")
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  @@map("profiles")
+}
+
+model UserSocialLink {
+  id       String @id @default(cuid())
+  userId   String
+  user     User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+  platform String // "github" | "linkedin" | "twitter" | "portfolio"
+  url      String
+
+  @@unique([userId, platform])
+  @@map("user_social_links")
+}
+
+// =============================================================================
+//  COURSE SYSTEM
+// =============================================================================
+
+/// Top-level course entity owned by an instructor.
+model Course {
+  id           String       @id @default(cuid())
+  instructorId String
+  instructor   User         @relation(fields: [instructorId], references: [id], onDelete: Restrict)
+
+  title        String
+  slug         String       @unique
+  subtitle     String?
+  description  String       @db.Text
+  thumbnailUrl String?
+  previewVideoUrl String?
+
+  price        Decimal      @default(0) @db.Decimal(10, 2)
+  currency     String       @default("USD")
+
+  status       CourseStatus @default(DRAFT)
+  difficulty   Difficulty
+  tags         String[]
+  language     String       @default("en")
+
+  // Learning meta
+  objectives     String[]  // "By the end you will..."
+  prerequisites  String[]
+  targetAudience String?
+
+  // Completion rule: % of lessons completed to unlock certificate
+  completionThreshold Float @default(80)
+
+  // Soft delete
+  deletedAt    DateTime?
+
+  // Audit
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+  publishedAt  DateTime?
+
+  // Relations
+  modules      Module[]
+  enrollments  Enrollment[]
+  quizzes      Quiz[]
+  assignments  Assignment[]
+  certificates Certificate[]
+  discussions  DiscussionPost[]
+
+  @@index([instructorId])
+  @@index([status, difficulty])
+  @@index([slug])
+  @@index([deletedAt])
+  @@index([tags])        // GIN index applied via migration
+  @@map("courses")
+}
+
+/// Ordered grouping of lessons within a course.
+model Module {
+  id          String    @id @default(cuid())
+  courseId    String
+  course      Course    @relation(fields: [courseId], references: [id], onDelete: Cascade)
+
+  title       String
+  description String?
+  order       Int
+
+  isPublished Boolean   @default(false)
+
+  // Soft delete
+  deletedAt   DateTime?
+
+  // Audit
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  lessons     Lesson[]
+
+  @@index([courseId, order])
+  @@index([deletedAt])
+  @@map("modules")
+}
+
+/// Individual content unit: video, reading, or mixed.
+model Lesson {
+  id           String    @id @default(cuid())
+  moduleId     String
+  module       Module    @relation(fields: [moduleId], references: [id], onDelete: Cascade)
+
+  title        String
+  order        Int
+
+  // Content
+  videoUrl     String?   // Cloudinary HLS URL
+  videoPublicId String?  // Cloudinary public ID for deletion
+  duration     Int?      // seconds
+  content      String?   @db.Text  // markdown/rich text body
+  resourceUrls String[]  // PDF/file attachments
+
+  isFree       Boolean   @default(false)
+  isPublished  Boolean   @default(false)
+
+  // Soft delete
+  deletedAt    DateTime?
+
+  // Audit
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  progress     LessonProgress[]
+
+  @@index([moduleId, order])
+  @@index([deletedAt])
+  @@map("lessons")
+}
+
+/// Junction: student ↔ course. Tracks overall progress & completion.
+model Enrollment {
+  id          String    @id @default(cuid())
+  userId      String
+  courseId    String
+  user        User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  course      Course    @relation(fields: [courseId], references: [id], onDelete: Restrict)
+
+  progress    Float     @default(0)   // 0.0–100.0 — recomputed on lesson complete
+  enrolledAt  DateTime  @default(now())
+  completedAt DateTime?
+  lastActivity DateTime?
+
+  // Refund/unenroll
+  refundedAt  DateTime?
+
+  @@unique([userId, courseId])
+  @@index([userId])
+  @@index([courseId])
+  @@index([completedAt])
+  @@map("enrollments")
+}
+
+/// Per-lesson watch/read progress per student.
+model LessonProgress {
+  id         String   @id @default(cuid())
+  userId     String
+  lessonId   String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lesson     Lesson   @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+
+  completed  Boolean  @default(false)
+  watchedSec Int      @default(0)
+  completedAt DateTime?
+
+  // Audit
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  @@unique([userId, lessonId])
+  @@index([userId])
+  @@index([lessonId])
+  @@map("lesson_progress")
+}
+
+// =============================================================================
+//  QUIZ SYSTEM
+// =============================================================================
+
+model Quiz {
+  id           String        @id @default(cuid())
+  courseId     String
+  course       Course        @relation(fields: [courseId], references: [id], onDelete: Cascade)
+
+  title        String
+  description  String?
+  instructions String?       @db.Text
+  timeLimitSec Int?          // null = untimed
+  passingScore Float         @default(70)   // percentage
+  maxAttempts  Int?          // null = unlimited
+  isPublished  Boolean       @default(false)
+  isAiGen      Boolean       @default(false)
+  shuffleQuestions Boolean   @default(false)
+
+  // Soft delete
+  deletedAt    DateTime?
+
+  // Audit
+  createdAt    DateTime      @default(now())
+  updatedAt    DateTime      @updatedAt
+
+  questions    Question[]
+  attempts     QuizAttempt[]
+
+  @@index([courseId])
+  @@index([deletedAt])
+  @@map("quizzes")
+}
+
+model Question {
+  id           String       @id @default(cuid())
+  quizId       String
+  quiz         Quiz         @relation(fields: [quizId], references: [id], onDelete: Cascade)
+
+  type         QuestionType
+  body         String       @db.Text
+  explanation  String?      @db.Text  // shown after attempt
+  options      Json         // QuizOption[] — see types package
+  points       Int          @default(1)
+  order        Int
+  shuffleOptions Boolean    @default(false)
+
+  // Soft delete
+  deletedAt    DateTime?
+
+  // Audit
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  @@index([quizId, order])
+  @@index([deletedAt])
+  @@map("questions")
+}
+
+model QuizAttempt {
+  id            String    @id @default(cuid())
+  userId        String
+  quizId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  quiz          Quiz      @relation(fields: [quizId], references: [id], onDelete: Restrict)
+
+  answers       Json      // Record<questionId, optionId | optionId[]>
+  score         Float     @default(0)
+  maxScore      Float     @default(0)
+  passed        Boolean   @default(false)
+
+  // Timing
+  startedAt     DateTime  @default(now())
+  submittedAt   DateTime?
+  timeSpentSec  Int?
+
+  @@index([userId, quizId])
+  @@index([quizId])
+  @@index([submittedAt])
+  @@map("quiz_attempts")
+}
+
+// =============================================================================
+//  ASSIGNMENT SYSTEM
+// =============================================================================
+
+/// Long-form assignments (file upload / text submission) with manual grading.
+model Assignment {
+  id          String    @id @default(cuid())
+  courseId    String
+  course      Course    @relation(fields: [courseId], references: [id], onDelete: Cascade)
+
+  title       String
+  description String    @db.Text
+  dueDate     DateTime?
+  maxScore    Float     @default(100)
+  isPublished Boolean   @default(false)
+
+  // Soft delete
+  deletedAt   DateTime?
+
+  // Audit
+  createdAt   DateTime  @default(now())
+  updatedAt   DateTime  @updatedAt
+
+  submissions AssignmentSubmission[]
+
+  @@index([courseId])
+  @@index([dueDate])
+  @@index([deletedAt])
+  @@map("assignments")
+}
+
+model AssignmentSubmission {
+  id           String           @id @default(cuid())
+  assignmentId String
+  userId       String
+  assignment   Assignment       @relation(fields: [assignmentId], references: [id], onDelete: Cascade)
+  user         User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  content      String?          @db.Text   // text answer
+  fileUrls     String[]         // Cloudinary URLs
+  status       AssignmentStatus @default(DRAFT)
+
+  // Grading
+  score        Float?
+  feedback     String?          @db.Text
+  gradedAt     DateTime?
+  gradedById   String?          // instructor user ID
+
+  // Timestamps
+  submittedAt  DateTime?
+  createdAt    DateTime         @default(now())
+  updatedAt    DateTime         @updatedAt
+
+  @@unique([assignmentId, userId])
+  @@index([assignmentId])
+  @@index([userId])
+  @@index([status])
+  @@map("assignment_submissions")
+}
+
+// =============================================================================
+//  CODING CHALLENGE PLATFORM
+// =============================================================================
+
+model CodingChallenge {
+  id           String     @id @default(cuid())
+  authorId     String?    // null = seeded by platform
+  author       User?      @relation("ChallengeAuthor", fields: [authorId], references: [id], onDelete: SetNull)
+
+  title        String
+  slug         String     @unique
+  description  String     @db.Text  // markdown
+  editorialUrl String?   // link to editorial explanation
+
+  difficulty   Difficulty
+  tags         String[]
+  topics       String[]   // "arrays", "dynamic-programming", etc.
+
+  starterCode  Json       // Record<Language, string>
+  constraints  String?    @db.Text
+  examples     Json?      // [{input, output, explanation}]
+
+  timeLimitMs  Int        @default(2000)
+  memLimitMb   Int        @default(128)
+
+  isPublished  Boolean    @default(false)
+  totalSubmissions Int    @default(0)  // denormalised counter
+  acceptedSubmissions Int @default(0)  // denormalised counter
+
+  // Soft delete
+  deletedAt    DateTime?
+
+  // Audit
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  testCases    TestCase[]
+  submissions  Submission[]
+
+  @@index([difficulty, isPublished])
+  @@index([slug])
+  @@index([authorId])
+  @@index([deletedAt])
+  @@index([tags])
+  @@map("coding_challenges")
+}
+
+model TestCase {
+  id          String          @id @default(cuid())
+  challengeId String
+  challenge   CodingChallenge @relation(fields: [challengeId], references: [id], onDelete: Cascade)
+
+  input       String          @db.Text
+  expected    String          @db.Text
+  explanation String?         // shown on wrong answer (public test cases only)
+  isHidden    Boolean         @default(false)  // hidden = not shown to user
+  isSample    Boolean         @default(false)  // shown in problem statement
+  order       Int
+  scoreWeight Float           @default(1.0)   // weighted scoring (future)
+
+  // Audit
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  @@index([challengeId, isHidden])
+  @@index([challengeId, order])
+  @@map("test_cases")
+}
+
+model Submission {
+  id          String           @id @default(cuid())
+  userId      String
+  challengeId String
+  user        User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+  challenge   CodingChallenge  @relation(fields: [challengeId], references: [id], onDelete: Restrict)
+
+  code        String           @db.Text
+  language    Language
+  status      SubmissionStatus @default(PENDING)
+
+  // Results
+  runtime     Int?             // ms — best passing test case
+  memory      Int?             // KB — peak across test cases
+  testResults Json?            // TestCaseResult[]
+  passedCount Int              @default(0)
+  totalCount  Int              @default(0)
+  errorMessage String?         @db.Text
+
+  // AI
+  aiReview    String?          @db.Text
+  aiReviewedAt DateTime?
+
+  // Mode: "run" doesn't count toward stats; "submit" does
+  isSubmit    Boolean          @default(true)
+
+  // Audit
+  createdAt   DateTime         @default(now())
+  updatedAt   DateTime         @updatedAt
+
+  @@index([userId, challengeId])
+  @@index([userId, status])
+  @@index([challengeId, status])
+  @@index([createdAt])
+  @@map("submissions")
+}
+
+// =============================================================================
+//  CERTIFICATES
+// =============================================================================
+
+model Certificate {
+  id         String   @id @default(cuid())
+  userId     String
+  courseId   String
+  user       User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  course     Course   @relation(fields: [courseId], references: [id], onDelete: Restrict)
+
+  uniqueCode String   @unique @default(cuid())
+  pdfUrl     String?
+  pdfPublicId String? // Cloudinary public ID
+
+  // Metadata snapshot at time of issue (course may change later)
+  courseTitleSnapshot  String
+  instructorNameSnapshot String
+
+  issuedAt   DateTime @default(now())
+
+  @@unique([userId, courseId])
+  @@index([uniqueCode])
+  @@index([userId])
+  @@map("certificates")
+}
+
+// =============================================================================
+//  NOTIFICATIONS
+// =============================================================================
+
+model Notification {
+  id        String           @id @default(cuid())
+  userId    String
+  user      User             @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  type      NotificationType
+  title     String
+  body      String           @db.Text
+  actionUrl String?          // deep-link URL
+  isRead    Boolean          @default(false)
+  readAt    DateTime?
+  metadata  Json?            // arbitrary context {courseId?, submissionId?, ...}
+
+  // Audit
+  createdAt DateTime         @default(now())
+
+  @@index([userId, isRead])
+  @@index([userId, createdAt])
+  @@map("notifications")
+}
+
+// =============================================================================
+//  AI / CHAT
+// =============================================================================
+
+/// Persisted conversation thread per user per context.
+/// context key: "course:{id}" | "challenge:{id}" | "general"
+model ChatHistory {
+  id        String   @id @default(cuid())
+  userId    String
+  user      User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  context   String   // scoped key — keeps AI on-topic
+  messages  Json     // ChatMessage[] — trimmed to last 20 before API call
+
+  tokenCount Int     @default(0)   // approximate total tokens used
+
+  // Audit
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@unique([userId, context])
+  @@index([userId, context])
+  @@map("chat_histories")
+}
+
+// =============================================================================
+//  DISCUSSION / FORUM
+// =============================================================================
+
+/// Course-scoped discussion thread (questions, announcements, general).
+model DiscussionPost {
+  id          String         @id @default(cuid())
+  courseId    String
+  course      Course         @relation(fields: [courseId], references: [id], onDelete: Cascade)
+  authorId    String
+  author      User           @relation(fields: [authorId], references: [id], onDelete: Restrict)
+
+  title       String?        // null = reply
+  body        String         @db.Text
+  type        DiscussionType @default(GENERAL)
+
+  isPinned    Boolean        @default(false)
+  isResolved  Boolean        @default(false)  // for QUESTION type
+
+  // Tree structure: parentId null = top-level, non-null = reply
+  parentId    String?
+  parent      DiscussionPost?  @relation("PostReplies", fields: [parentId], references: [id], onDelete: Cascade)
+  replies     DiscussionPost[] @relation("PostReplies")
+
+  upvotes     Int            @default(0)   // denormalised
+  votes       DiscussionVote[]
+
+  // Soft delete
+  deletedAt   DateTime?
+
+  // Audit
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  @@index([courseId, type])
+  @@index([authorId])
+  @@index([parentId])
+  @@index([isPinned, createdAt])
+  @@index([deletedAt])
+  @@map("discussion_posts")
+}
+
+model DiscussionVote {
+  id        String         @id @default(cuid())
+  postId    String
+  userId    String
+  post      DiscussionPost @relation(fields: [postId], references: [id], onDelete: Cascade)
+  user      User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  value     Int            // +1 or -1
+
+  createdAt DateTime       @default(now())
+
+  @@unique([postId, userId])
+  @@map("discussion_votes")
+}
+
+// =============================================================================
+//  AUDIT LOG
+// =============================================================================
+
+/// Append-only log for ADMIN-level mutations. Never updated or deleted.
+model AuditLog {
+  id         String   @id @default(cuid())
+  actorId    String
+  actor      User     @relation(fields: [actorId], references: [id], onDelete: Restrict)
+
+  action     String   // "USER_ROLE_CHANGED" | "COURSE_PUBLISHED" | etc.
+  targetType String   // "User" | "Course" | "Submission" ...
+  targetId   String
+  before     Json?    // snapshot before
+  after      Json?    // snapshot after
+  ipAddress  String?
+  userAgent  String?
+
+  createdAt  DateTime @default(now())
+
+  @@index([actorId])
+  @@index([targetType, targetId])
+  @@index([createdAt])
+  @@map("audit_logs")
+}
